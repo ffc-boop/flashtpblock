@@ -1,5 +1,6 @@
--- official cathub semi tp source 
+-- official cathub semi tp source
 -- revamped by @atlanta.rar
+-- stealth build: hidden GUI, executor fallbacks, no VirtualInputManager
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -9,6 +10,73 @@ local SoundService = game:GetService("SoundService")
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- Executor compatibility layer
+-- Every primitive below has a fallback so the hub runs on Xeno and friends.
+-- VirtualInputManager / VirtualUser are deliberately never touched.
+--------------------------------------------------------------------------------
+local function executorUiParent()
+    local parent
+    pcall(function() if type(gethui) == "function" then parent = gethui() end end)
+    if not parent then pcall(function() parent = game:GetService("CoreGui") end) end
+    if not parent then parent = PlayerGui end
+    return parent
+end
+local UIParent = executorUiParent()
+
+local function protectGui(gui)
+    pcall(function() if type(protectgui) == "function" then protectgui(gui) end end)
+    pcall(function()
+        if type(syn) == "table" and type(syn.protect_gui) == "function" then syn.protect_gui(gui) end
+    end)
+end
+
+-- Client-only container for ESP adornments: nothing lands in workspace, so the
+-- game's anti-cheat cannot enumerate it with workspace:GetDescendants().
+local EspRoot = Instance.new("Folder")
+EspRoot.Name = "Perf"
+EspRoot.Parent = UIParent
+
+-- Fires a ProximityPrompt without any input synthesis.
+local function firePrompt(prompt)
+    if not prompt then return false end
+    if type(fireproximityprompt) == "function" then
+        if pcall(fireproximityprompt, prompt) then return true end
+    end
+    local held = false
+    pcall(function()
+        if type(prompt.InputHoldBegin) == "function" then
+            prompt:InputHoldBegin()
+            held = true
+        end
+    end)
+    if held then
+        task.wait(math.max(0.05, tonumber(prompt.HoldDuration) or 0.1))
+        pcall(function()
+            if type(prompt.InputHoldEnd) == "function" then prompt:InputHoldEnd() end
+        end)
+        return true
+    end
+    -- Last resort: fire the prompt's own Triggered connections.
+    if type(getconnections) == "function" then
+        local ok, list = pcall(getconnections, prompt.Triggered)
+        if ok and type(list) == "table" then
+            for _, connection in ipairs(list) do
+                if type(connection.Fire) == "function" then
+                    pcall(function() connection:Fire() end)
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function smokeClick()
+    if type(mouse1click) == "function" then pcall(mouse1click) end
+end
+
 local AnimalsData = {}
 do
     local success, result = pcall(function()
@@ -48,15 +116,19 @@ local CONFIG_FILE = "CatHUB_Config.json"
 local savedConfig = {}
 local function loadConfig()
     pcall(function()
-        if isfile(CONFIG_FILE) then
+        if type(isfile) == "function" and type(readfile) == "function" and isfile(CONFIG_FILE) then
             local raw = readfile(CONFIG_FILE)
             savedConfig = HttpService:JSONDecode(raw)
         end
     end)
 end
 loadConfig()
+local function plotsFolder()
+    return workspace:FindFirstChild("Plots")
+end
 local function isMyBase(plotName)
-    local plot = workspace.Plots:FindFirstChild(plotName)
+    local plots = plotsFolder()
+    local plot = plots and plots:FindFirstChild(plotName)
     if not plot then return false end
     local sign = plot:FindFirstChild("PlotSign")
     if sign then
@@ -93,30 +165,31 @@ LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.3)
     if speedBoostEnabled then enableSpeedBoost() end
 end)
+local espObjects = {}
 local function createESP(plr)
     if plr == LocalPlayer then return end
     if not plr.Character then return end
     local char = plr.Character
-    if char:FindFirstChild("CatHUB_ESP_Hitbox") then return end
+    if espObjects[plr] then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local head = char:FindFirstChild("Head")
     if not (hrp and head) then return end
     local hitbox = Instance.new("BoxHandleAdornment")
-    hitbox.Name = "CatHUB_ESP_Hitbox"
+    hitbox.Name = "Hitbox"
     hitbox.Adornee = hrp
     hitbox.Size = Vector3.new(4, 6, 2)
     hitbox.Color3 = Color3.fromRGB(128, 0, 128)
     hitbox.Transparency = 0.6
     hitbox.ZIndex = 10
     hitbox.AlwaysOnTop = true
-    hitbox.Parent = char
+    hitbox.Parent = EspRoot
     local billboard = Instance.new("BillboardGui")
-    billboard.Name = "CatHUB_ESP_Name"
+    billboard.Name = "Tag"
     billboard.Adornee = head
     billboard.Size = UDim2.new(0, 200, 0, 50)
     billboard.StudsOffset = Vector3.new(0, 3, 0)
     billboard.AlwaysOnTop = true
-    billboard.Parent = char
+    billboard.Parent = EspRoot
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1, 0, 1, 0)
     label.BackgroundTransparency = 1
@@ -127,13 +200,15 @@ local function createESP(plr)
     label.TextStrokeTransparency = 0.7
     label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
     label.Parent = billboard
+    espObjects[plr] = {hitbox = hitbox, billboard = billboard}
 end
 local function removeESP(plr)
-    if not plr.Character then return end
-    local hitbox = plr.Character:FindFirstChild("CatHUB_ESP_Hitbox")
-    local nameGui = plr.Character:FindFirstChild("CatHUB_ESP_Name")
-    if hitbox then hitbox:Destroy() end
-    if nameGui then nameGui:Destroy() end
+    local record = espObjects[plr]
+    if record then
+        if record.hitbox then record.hitbox:Destroy() end
+        if record.billboard then record.billboard:Destroy() end
+        espObjects[plr] = nil
+    end
 end
 local function enableESP()
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -141,6 +216,7 @@ local function enableESP()
             if plr.Character then createESP(plr) end
             local conn = plr.CharacterAdded:Connect(function()
                 task.wait(0.1)
+                removeESP(plr)
                 if espEnabled then createESP(plr) end
             end)
             table.insert(espConnections, conn)
@@ -150,6 +226,7 @@ local function enableESP()
         if plr == LocalPlayer then return end
         local charAddedConn = plr.CharacterAdded:Connect(function()
             task.wait(0.1)
+            removeESP(plr)
             if espEnabled then createESP(plr) end
         end)
         table.insert(espConnections, charAddedConn)
@@ -171,6 +248,7 @@ LocalPlayer.CharacterAdded:Connect(function()
 end)
 local COLOR_ALLOWED = Color3.fromRGB(0, 255, 100)
 local COLOR_DISALLOWED = Color3.fromRGB(255, 50, 50)
+local allowPromptInstances = {}
 local function updateAllowPrompt(prompt)
     local parent = prompt.Parent
     if not parent or not parent:IsA("BasePart") then return end
@@ -178,17 +256,19 @@ local function updateAllowPrompt(prompt)
     local actT = string.lower(prompt.ActionText or "")
     local combined = objT .. " " .. actT
     if not string.find(combined, "friend") then
-        if parent:FindFirstChild("FriendInd") then parent.FriendInd:Destroy() end
+        local existing = allowPromptInstances[parent]
+        if existing then existing:Destroy(); allowPromptInstances[parent] = nil end
         return
     end
-    local bb = parent:FindFirstChild("FriendInd")
-    if not bb then
+    local bb = allowPromptInstances[parent]
+    if not bb or not bb.Parent then
         bb = Instance.new("BillboardGui")
-        bb.Name = "FriendInd"
+        bb.Name = "Tag"
+        bb.Adornee = parent
         bb.Size = UDim2.new(0, 160, 0, 45)
         bb.AlwaysOnTop = true
         bb.ExtentsOffset = Vector3.new(0, 3, 0)
-        bb.Parent = parent
+        bb.Parent = EspRoot
         local lbl = Instance.new("TextLabel")
         lbl.Name = "StatusLabel"
         lbl.Parent = bb
@@ -198,6 +278,7 @@ local function updateAllowPrompt(prompt)
         lbl.TextSize = 22
         lbl.TextStrokeTransparency = 0.4
         lbl.TextStrokeColor3 = Color3.new(0, 0, 0)
+        allowPromptInstances[parent] = bb
     end
     local lbl = bb:FindFirstChild("StatusLabel")
     local isCurrentlyAllowed = string.find(combined, "disallow")
@@ -233,11 +314,9 @@ local function disableAllowESP()
         if conn and conn.Connected then conn:Disconnect() end
     end
     allowEspConnections = {}
-    for _, o in ipairs(workspace:GetDescendants()) do
-        if o:IsA("BasePart") then
-            local ind = o:FindFirstChild("FriendInd")
-            if ind then ind:Destroy() end
-        end
+    for part, bb in pairs(allowPromptInstances) do
+        if bb and bb.Parent then bb:Destroy() end
+        allowPromptInstances[part] = nil
     end
 end
 local function createBaseLockESP(plot, mainPart)
@@ -245,13 +324,13 @@ local function createBaseLockESP(plot, mainPart)
         baseLockEspInstances[plot.Name]:Destroy()
     end
     local billboard = Instance.new("BillboardGui")
-    billboard.Name = "CatHUB_BaseLock_" .. plot.Name
+    billboard.Name = "Tag"
     billboard.Size = UDim2.new(0, 50, 0, 25)
     billboard.StudsOffset = Vector3.new(0, 5, 0)
     billboard.AlwaysOnTop = true
     billboard.Adornee = mainPart
     billboard.MaxDistance = 1000
-    billboard.Parent = plot
+    billboard.Parent = EspRoot
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1, 0, 1, 0)
     label.BackgroundTransparency = 1
@@ -265,9 +344,9 @@ local function createBaseLockESP(plot, mainPart)
     return billboard
 end
 local function updateBaseLockESP()
-    local plotsFolder = workspace:FindFirstChild("Plots")
-    if not plotsFolder then return end
-    for _, plot in ipairs(plotsFolder:GetChildren()) do
+    local plots = plotsFolder()
+    if not plots then return end
+    for _, plot in ipairs(plots:GetChildren()) do
         local purchases = plot:FindFirstChild("Purchases")
         local plotBlock = purchases and purchases:FindFirstChild("PlotBlock")
         local mainPart = plotBlock and plotBlock:FindFirstChild("Main")
@@ -296,6 +375,7 @@ local function disableBaseLockESP()
     end
     for name, billboard in pairs(baseLockEspInstances) do
         if billboard and billboard.Parent then billboard:Destroy() end
+        baseLockEspInstances[name] = nil
     end
     baseLockEspInstances = {}
 end
@@ -481,7 +561,7 @@ local RIGHT_THIRD_TP  = Vector3.new(-336.80865478515625, -5.101069927215576, 17.
 local RIGHT_LAST_TP   = Vector3.new(-355.8482666015625, -7.000002384185791, 42.20612716674805)
 local currentBaseSide = "?"
 local function getMyPlot()
-    local plots = workspace:FindFirstChild("Plots")
+    local plots = plotsFolder()
     if not plots then return nil end
     for _, plot in ipairs(plots:GetChildren()) do
         if plot:IsA("Model") and isMyBase(plot.Name) then return plot end
@@ -572,7 +652,8 @@ local function findProximityPromptForAnimal(animalData)
     if not animalData then return nil end
     local cached = PromptMemoryCache[animalData.uid]
     if cached and cached.Parent then return cached end
-    local plot = workspace.Plots:FindFirstChild(animalData.plot)
+    local plots = plotsFolder()
+    local plot = plots and plots:FindFirstChild(animalData.plot)
     if not plot then return nil end
     local podiums = plot:FindFirstChild("AnimalPodiums")
     if not podiums then return nil end
@@ -592,13 +673,15 @@ end
 local function buildStealCallbacks(prompt)
     if InternalStealCache[prompt] then return end
     local data = { holdCallbacks = {}, triggerCallbacks = {}, ready = true }
-    local ok1, c1 = pcall(getconnections, prompt.PromptButtonHoldBegan)
-    if ok1 and type(c1) == "table" then
-        for _, c in ipairs(c1) do if type(c.Function) == "function" then table.insert(data.holdCallbacks, c.Function) end end
-    end
-    local ok2, c2 = pcall(getconnections, prompt.Triggered)
-    if ok2 and type(c2) == "table" then
-        for _, c in ipairs(c2) do if type(c.Function) == "function" then table.insert(data.triggerCallbacks, c.Function) end end
+    if type(getconnections) == "function" then
+        local ok1, c1 = pcall(getconnections, prompt.PromptButtonHoldBegan)
+        if ok1 and type(c1) == "table" then
+            for _, c in ipairs(c1) do if type(c.Function) == "function" then table.insert(data.holdCallbacks, c.Function) end end
+        end
+        local ok2, c2 = pcall(getconnections, prompt.Triggered)
+        if ok2 and type(c2) == "table" then
+            for _, c in ipairs(c2) do if type(c.Function) == "function" then table.insert(data.triggerCallbacks, c.Function) end end
+        end
     end
     if (#data.holdCallbacks > 0) or (#data.triggerCallbacks > 0) then InternalStealCache[prompt] = data end
 end
@@ -613,7 +696,7 @@ local function getNearestAnimalFromPos(pos)
     return nearest
 end
 local function isOwnPlot(obj)
-    local plots = workspace:FindFirstChild("Plots")
+    local plots = plotsFolder()
     if not plots then return false end
     for _, plot in ipairs(plots:GetChildren()) do
         local isOwned = false
@@ -658,7 +741,7 @@ local function triggerUnlockFloor1()
     local shortestDistSameLevel = math.huge
     local bestPromptFallback = nil
     local shortestDistFallback = math.huge
-    local plots = workspace:FindFirstChild("Plots")
+    local plots = plotsFolder()
     if not plots then return end
     for _, obj in ipairs(plots:GetDescendants()) do
         if obj:IsA("ProximityPrompt") and obj.Enabled then
@@ -688,21 +771,21 @@ local function triggerUnlockFloor1()
     local targetPrompt = bestPromptSameLevel or bestPromptFallback
     if targetPrompt then
         local originalDist = targetPrompt.MaxActivationDistance
-        targetPrompt.MaxActivationDistance = 9999
-        if fireproximityprompt then
-            fireproximityprompt(targetPrompt)
-        else
-            targetPrompt:InputBegan(Enum.UserInputType.MouseButton1)
-            task.wait(0.05)
-            targetPrompt:InputEnded(Enum.UserInputType.MouseButton1)
-        end
+        pcall(function() targetPrompt.MaxActivationDistance = 9999 end)
+        firePrompt(targetPrompt)
         task.delay(0.2, function()
-            targetPrompt.MaxActivationDistance = originalDist
+            pcall(function() targetPrompt.MaxActivationDistance = originalDist end)
         end)
     end
 end
-if PlayerGui:FindFirstChild("CatHUB_Halfway") then
-    PlayerGui:FindFirstChild("CatHUB_Halfway"):Destroy()
+local UI_NAME = "PerformanceOverlay"
+for _, container in ipairs({PlayerGui, UIParent}) do
+    local old = container:FindFirstChild(UI_NAME) or container:FindFirstChild("CatHUB_Halfway")
+    if old then old:Destroy() end
+end
+-- Clear ESP leftovers from older builds that sat inside workspace.
+for _, obj in ipairs(workspace:GetDescendants()) do
+    if obj.Name:sub(1, 6) == "CatHUB" then obj:Destroy() end
 end
 local function makeDraggable(topbar, frame)
     local dragging, dragInput, dragStart, startPos
@@ -734,13 +817,14 @@ local function makeDraggable(topbar, frame)
     end)
 end
 local obj1 = Instance.new("ScreenGui")
-obj1.Name = "CatHUB_Halfway"
+obj1.Name = UI_NAME
 obj1.Enabled = true
 obj1.ResetOnSpawn = false
 obj1.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 obj1.DisplayOrder = 0
 obj1.IgnoreGuiInset = false
-obj1.Parent = PlayerGui
+obj1.Parent = UIParent
+protectGui(obj1)
 local obj2 = Instance.new("Frame")
 obj2.Name = "MainFrame"
 obj2.Visible = true
@@ -1034,6 +1118,7 @@ createToggleRow(obj11, 0, "Activate", "Performs desync and maintains flags", fal
     if on then
         task.spawn(function()
             pcall(function()
+                if type(setfflag) ~= "function" then return end
                 setfflag('GameNetPVHeaderRotationalVelocityZeroCutoffExponent', '-5000')
                 setfflag('LargeReplicatorWrite5', 'true')
                 setfflag('LargeReplicatorEnabled9', 'true')
@@ -1080,11 +1165,15 @@ createToggleRow(obj11, 0, "Activate", "Performs desync and maintains flags", fal
                 local hum = char:FindFirstChildWhichIsA("Humanoid")
                 if hum then hum:ChangeState(Enum.HumanoidStateType.Dead) end
                 char:ClearAllChildren()
-                local fake = Instance.new("Model"); fake.Parent = workspace; LocalPlayer.Character = fake
+                local fake = Instance.new("Model")
+                fake.Name = "Model"
+                fake.Archivable = false
+                fake.Parent = workspace
+                LocalPlayer.Character = fake
             end
         end)
     end
-end) 
+end)
 createToggleRow(obj11, 57, "Use Potion on Steal", "Activates Giant Potion during steal", false, function(on)
     giantPotionEnabled = on
 end)
@@ -1311,7 +1400,14 @@ local function executeSemiInstant()
     InternalStealCache[prompt] = nil
     buildStealCallbacks(prompt)
     local data = InternalStealCache[prompt]
-    if not data or not data.ready then resetExecuteState(); return end
+    -- No getconnections / no captured callbacks: drive the prompt's own API.
+    local useNativeHold = not data
+        or (#data.holdCallbacks == 0 and #data.triggerCallbacks == 0)
+    if useNativeHold then
+        data = { ready = true, holdCallbacks = {}, triggerCallbacks = {} }
+        InternalStealCache[prompt] = data
+    end
+    if not data.ready then resetExecuteState(); return end
     data.ready = false
     local grabDuration = 1.3
     if prompt and prompt.HoldDuration then
@@ -1319,10 +1415,14 @@ local function executeSemiInstant()
     end
     local totalBarDuration = grabDuration + 0.8
     stealBarFillUp(totalBarDuration)
-    if #data.holdCallbacks > 0 then
+    if not useNativeHold then
         for _, fn in ipairs(data.holdCallbacks) do
             task.spawn(fn)
         end
+    else
+        pcall(function()
+            if type(prompt.InputHoldBegin) == "function" then prompt:InputHoldBegin() end
+        end)
     end
     local holdStart = tick()
     task.wait(0.9)
@@ -1375,13 +1475,17 @@ local function executeSemiInstant()
         hrp.CFrame = CFrame.new(LAST_TP)
     end
     task.wait(0.03)
-    if #data.triggerCallbacks > 0 then
+    if not useNativeHold then
         for _, fn in ipairs(data.triggerCallbacks) do
             task.spawn(fn)
         end
+    else
+        pcall(function()
+            if type(prompt.InputHoldEnd) == "function" then prompt:InputHoldEnd() end
+        end)
     end
     if giantPotionEnabled then
-        pcall(mouse1click)
+        smokeClick()
     end
     task.wait(0.1)
     data.ready = true
@@ -1407,7 +1511,7 @@ end)
 task.spawn(initializeScanner)
 task.spawn(function() task.wait(1); pcall(detectBaseSide) end)
 local obj107 = Instance.new("Frame")
-obj107.Name = "DiscordBar"
+obj107.Name = "ProgressBar"
 obj107.Position = UDim2.new(0.5, -120, 0, 10)
 obj107.Size = UDim2.new(0, 240, 0, 34)
 obj107.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
