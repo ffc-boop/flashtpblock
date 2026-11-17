@@ -10,6 +10,167 @@ local Lighting = game:GetService("Lighting")
 local LP = Players.LocalPlayer
 local LocalPlayer = LP
 
+--=============================================================================
+-- Executor / stealth layer
+--   Every risky primitive is guarded and has a fallback. No synthetic input
+--   events are generated and no engine input service is touched. Nothing is
+--   parented into workspace or into a character.
+--=============================================================================
+local S = {}
+do
+    S.ENV_PATCH = false   -- patches Net/Synchronizer environments: left off
+    S.DEBUG_VIZ = false   -- neon path visualisation parts: left off
+
+    local function inGame(i)
+        if not i then return false end
+        local ok, res = pcall(function() return i:IsDescendantOf(game) end)
+        return ok and res
+    end
+
+    -- Container used for ScreenGuis: hidden UI first, then CoreGui, then PlayerGui.
+    function S.hiddenRoot()
+        local root
+        pcall(function()
+            if type(gethui) == "function" then root = gethui() end
+        end)
+        if not inGame(root) then
+            local cg
+            pcall(function() cg = game:GetService("CoreGui") end)
+            if cg then root = cg end
+        end
+        if not inGame(root) then
+            local pg
+            pcall(function() pg = LP:FindFirstChildOfClass("PlayerGui") end)
+            if pg then root = pg end
+        end
+        return root
+    end
+
+    function S.protect(gui)
+        if not gui then return end
+        pcall(function()
+            if type(protectgui) == "function" then protectgui(gui) end
+        end)
+        pcall(function()
+            if type(syn) == "table" and type(syn.protect_gui) == "function" then
+                syn.protect_gui(gui)
+            end
+        end)
+    end
+
+    -- Client-only render container for world visuals (billboards, highlights).
+    function S.visualRoot()
+        if S._visualRoot and S._visualRoot.Parent then return S._visualRoot end
+        local f = Instance.new("Folder")
+        f.Name = "Fx"
+        local root = S.hiddenRoot()
+        if root then pcall(function() f.Parent = root end) end
+        if not f.Parent then
+            pcall(function() f.Parent = LP:FindFirstChildOfClass("PlayerGui") end)
+        end
+        S._visualRoot = f
+        return f
+    end
+
+    local function fireConnections(signal)
+        if type(getconnections) ~= "function" then return false end
+        local ok, list = pcall(getconnections, signal)
+        if not ok or type(list) ~= "table" then return false end
+        local fired = false
+        for _, c in ipairs(list) do
+            if type(c.Fire) == "function" then
+                pcall(function() c:Fire() end)
+                fired = true
+            end
+        end
+        return fired
+    end
+
+    -- Press a GuiButton without synthetic input. Signals that actually have a
+    -- handler attached are preferred, so a no-op signal is never reported as a
+    -- successful click.
+    function S.clickButton(btn)
+        if not btn or not btn.Parent then return false end
+        if type(getconnections) == "function" then
+            for _, signal in ipairs({ btn.MouseButton1Click, btn.Activated, btn.MouseButton1Up }) do
+                local ok, list = pcall(getconnections, signal)
+                if ok and type(list) == "table" and #list > 0 then
+                    local fired = false
+                    for _, c in ipairs(list) do
+                        if type(c.Fire) == "function" then
+                            pcall(function() c:Fire() end)
+                            fired = true
+                        end
+                    end
+                    if fired then return true end
+                end
+            end
+        end
+        if type(firesignal) == "function" then
+            if pcall(firesignal, btn.MouseButton1Up) then return true end
+            if pcall(firesignal, btn.MouseButton1Click) then return true end
+            if pcall(firesignal, btn.Activated) then return true end
+        end
+        return false
+    end
+
+    -- Activate a Tool. Tool:Activate() is the engine's own activation entry
+    -- point and replicates to the server, so it is tried first. mouse1click is
+    -- only a fallback because it clicks wherever the cursor happens to be.
+    function S.clickTool(tool)
+        if not tool then return false end
+        if tool:IsA("Tool") and pcall(function() tool:Activate() end) then return true end
+        if type(mouse1click) == "function" then
+            if pcall(mouse1click) then return true end
+        end
+        return fireConnections(tool.Activated)
+    end
+
+    -- Trigger a ProximityPrompt.
+    function S.firePrompt(prompt)
+        if not prompt or not prompt.Parent then return false end
+        local hold = tonumber(prompt.HoldDuration) or 0
+        if type(fireproximityprompt) == "function" then
+            if pcall(fireproximityprompt, prompt, hold) then return true end
+            if pcall(fireproximityprompt, prompt) then return true end
+        end
+        local held = false
+        pcall(function()
+            if type(prompt.InputHoldBegin) == "function" then
+                prompt:InputHoldBegin()
+                held = true
+            end
+        end)
+        if held then
+            task.wait(math.max(0.05, hold))
+            pcall(function()
+                if type(prompt.InputHoldEnd) == "function" then prompt:InputHoldEnd() end
+            end)
+            return true
+        end
+        return fireConnections(prompt.Triggered)
+    end
+
+    -- Fire the grapple: game remote first, tool API only if the remote is dead.
+    function S.fireGrappleSafe()
+        local remoteOK = false
+        if type(_G.VanishFireGrapple) == "function" then
+            remoteOK = pcall(_G.VanishFireGrapple) and _G.NetModuleReady == true
+        end
+        if remoteOK then return true end
+        local char = LP.Character
+        local tool = char and char:FindFirstChild("Grapple Hook")
+        if not tool then
+            local bp = char and char:FindFirstChildOfClass("Backpack")
+            tool = bp and bp:FindFirstChild("Grapple Hook")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if tool and hum then pcall(function() hum:EquipTool(tool) end) end
+        end
+        if tool then return S.clickTool(tool) end
+        return remoteOK
+    end
+end
+
 local _BLOCKING_MACHINE_TYPES = { Fuse = true, Duel = true, Trade = true, Crafting = true }
 local function _VanishIsFusing(animalData)
     if type(animalData) ~= "table" then return false end
@@ -20,7 +181,7 @@ end
 
 do
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    local getupvalue = getupvalue or debug.getupvalue
+    local getupvalue = getupvalue or (debug and debug.getupvalue)
 
     local function getInternalTable()
         local Packages = ReplicatedStorage:FindFirstChild("Packages")
@@ -101,22 +262,32 @@ do
     local Packages = ReplicatedStorage:FindFirstChild("Packages")
     local SynMod = Packages and Packages:FindFirstChild("Synchronizer")
     local okReq, syn = pcall(require, SynMod)
-    if okReq and typeof(syn) == "table" then
+    -- Patching the internals of a game module is the loudest thing this file
+    -- can do, and `isexecutorclosure` is not present on every executor. Both
+    -- are reasons this block is opt-in and fully guarded.
+    if S.ENV_PATCH and okReq and typeof(syn) == "table" and debug then
+        local isExec = isexecutorclosure or checkclosure or function() return false end
+        local newcc = newcclosure or function(f) return f end
+        -- Xeno does not expose debug.getupvalues; every debug primitive here is
+        -- optional and the whole block bails out when they are missing.
+        local getups = debug.getupvalues or rawget(_G, "getupvalues")
+        local setupv = debug.setupvalue or rawget(_G, "setupvalue")
+        if type(getups) ~= "function" or type(setupv) ~= "function" then return end
         local function HasBoolUpvalue(Fn)
-            local OkU, Ups = xpcall(debug.getupvalues, function() end, Fn)
-            if not OkU then return false end
+            local OkU, Ups = xpcall(getups, function() end, Fn)
+            if not OkU or type(Ups) ~= "table" then return false end
             for _, V in pairs(Ups) do
                 if typeof(V) == "boolean" then return true end
             end
             return false
         end
         for _, Fn in pairs(syn) do
-            if typeof(Fn) == "function" and not isexecutorclosure(Fn) then
-                local OkU, Ups = xpcall(debug.getupvalues, function() end, Fn)
-                if OkU then
+            if typeof(Fn) == "function" and not isExec(Fn) then
+                local OkU, Ups = xpcall(getups, function() end, Fn)
+                if OkU and type(Ups) == "table" then
                     for Idx, V in pairs(Ups) do
-                        if typeof(V) == "function" and not isexecutorclosure(V) and HasBoolUpvalue(V) then
-                            pcall(debug.setupvalue, Fn, Idx, newcclosure(function() end))
+                        if typeof(V) == "function" and not isExec(V) and HasBoolUpvalue(V) then
+                            pcall(setupv, Fn, Idx, newcc(function() end))
                         end
                     end
                 end
@@ -126,73 +297,85 @@ do
 end
 
 do
-    if getgenv()._net_getfenv_patched then return end
-    getgenv()._net_getfenv_patched = true
+    -- Was a bare `do` block that finished with a chunk-level `return`. If any
+    -- previous run had already set the flag, the whole file returned before the
+    -- menu was ever built. It is now a closure, gated behind S.ENV_PATCH.
+    local function patchEnvironment()
+        local gv = (type(getgenv) == "function" and getgenv()) or _G
+        if gv._net_getfenv_patched then return end
+        gv._net_getfenv_patched = true
 
-    local ok, NetModule = pcall(function()
-        return require(game:GetService("ReplicatedStorage")
-            :WaitForChild("Packages")
-            :WaitForChild("Net")
-            :FindFirstChildWhichIsA("ModuleScript", true))
-    end)
-    if not ok or type(NetModule) ~= "table" then return end
+        local ok, NetModule = pcall(function()
+            local pkgs = game:GetService("ReplicatedStorage"):WaitForChild("Packages", 10)
+            local net = pkgs and pkgs:WaitForChild("Net", 10)
+            local mod = net and net:FindFirstChildWhichIsA("ModuleScript", true)
+            if not mod then return nil end
+            return require(mod)
+        end)
+        if not ok or type(NetModule) ~= "table" then return end
 
-    local getupvalues = debug and debug.getupvalues or rawget(_G, "getupvalues")
-    local getprotos = debug and debug.getprotos or rawget(_G, "getprotos")
-    local newcc = rawget(_G, "newcclosure") or function(fn) return fn end
-    if not (getupvalues and getprotos) then return end
+        local getupvalues = debug and debug.getupvalues or rawget(_G, "getupvalues")
+        local getprotos = debug and debug.getprotos or rawget(_G, "getprotos")
+        local newcc = rawget(_G, "newcclosure") or function(fn) return fn end
+        if not (getupvalues and getprotos) then return end
 
-    local fake = newcc(function() return {} end)
-    local scanned = {}
-    local queue, processed = {}, 0
-    local function enqueue(fn)
-        if type(fn) == "function" and not scanned[fn] then queue[#queue + 1] = fn end
-    end
-    local function drain()
-        while #queue > 0 do
-            local fn = queue[#queue]; queue[#queue] = nil
-            if not scanned[fn] then
-                scanned[fn] = true
-                local okUps, ups = pcall(getupvalues, fn)
-                if okUps and ups then
-                    for _, up in pairs(ups) do
-                        if type(up) == "table" then
-                            for k, v in pairs(up) do
-                                if v == "getfenv" or v == "getrenv" then
-                                    pcall(function() up[k] = fake end)
-                                elseif type(v) == "function" then
-                                    enqueue(v)
+        local fake = newcc(function() return {} end)
+        local scanned = {}
+        local queue, processed = {}, 0
+        local function enqueue(fn)
+            if type(fn) == "function" and not scanned[fn] then queue[#queue + 1] = fn end
+        end
+        local function drain()
+            while #queue > 0 do
+                local fn = queue[#queue]; queue[#queue] = nil
+                if not scanned[fn] then
+                    scanned[fn] = true
+                    local okUps, ups = pcall(getupvalues, fn)
+                    if okUps and ups then
+                        for _, up in pairs(ups) do
+                            if type(up) == "table" then
+                                for k, v in pairs(up) do
+                                    if v == "getfenv" or v == "getrenv" then
+                                        pcall(function() up[k] = fake end)
+                                    elseif type(v) == "function" then
+                                        enqueue(v)
+                                    end
                                 end
+                            elseif type(up) == "function" then
+                                enqueue(up)
                             end
-                        elseif type(up) == "function" then
-                            enqueue(up)
                         end
                     end
+                    local okProtos, protos = pcall(getprotos, fn)
+                    if okProtos and protos then
+                        for _, proto in ipairs(protos) do enqueue(proto) end
+                    end
+                    processed = processed + 1
+                    if processed % 150 == 0 then task.wait() end
                 end
-                local okProtos, protos = pcall(getprotos, fn)
-                if okProtos and protos then
-                    for _, proto in ipairs(protos) do enqueue(proto) end
-                end
-                processed = processed + 1
-                if processed % 150 == 0 then task.wait() end
             end
         end
+
+        for _, v in pairs(NetModule) do enqueue(v) end
+
+        local okSync, SyncModule = pcall(function()
+            local pkgs = game:GetService("ReplicatedStorage"):WaitForChild("Packages", 10)
+            local s = pkgs and pkgs:WaitForChild("Synchronizer", 10)
+            if not s then return nil end
+            return require(s)
+        end)
+        if okSync and type(SyncModule) == "table" then
+            for _, v in pairs(SyncModule) do enqueue(v) end
+        end
+
+        drain()
     end
 
-    for _, v in pairs(NetModule) do enqueue(v) end
-
-    local okSync, SyncModule = pcall(function()
-        local s = game:GetService("ReplicatedStorage")
-            :WaitForChild("Packages")
-            :FindFirstChild("Synchronizer")
-        if not s then return nil end
-        return require(s)
-    end)
-    if okSync and type(SyncModule) == "table" then
-        for _, v in pairs(SyncModule) do enqueue(v) end
+    -- Off by default: rewriting the environment of the game's own networking
+    -- module is the loudest client-side tell in this file.
+    if S.ENV_PATCH then
+        task.spawn(function() pcall(patchEnvironment) end)
     end
-
-    drain()
 end
 
 _G.VanishGetSyncData = _G.VanishGetSyncData or function(plot)
@@ -217,8 +400,12 @@ end
 
 local Synchronizer, AnimalsData, AnimalsShared, NumberUtils
 
+local _lastModuleFail = 0
 local function loadModules()
-    if Synchronizer then return true end
+    if Synchronizer and AnimalsData and AnimalsShared then return true end
+    -- Every WaitForChild below has a timeout. Retrying the whole set on every
+    -- scan tick would stall the script for seconds per attempt, so back off.
+    if os.clock() - _lastModuleFail < 8 then return false end
     local ok = pcall(function()
         local Packages = RS:WaitForChild("Packages", 5)
         local Datas = RS:WaitForChild("Datas", 5)
@@ -229,7 +416,9 @@ local function loadModules()
         AnimalsShared = require(Shared:WaitForChild("Animals"))
         NumberUtils = require(Utils:WaitForChild("NumberUtils"))
     end)
-    return ok and Synchronizer ~= nil
+    if ok and Synchronizer and AnimalsData and AnimalsShared then return true end
+    _lastModuleFail = os.clock()
+    return false
 end
 
 local NetModule
@@ -238,8 +427,12 @@ local function loadNet()
     local ok, mod = pcall(function()
         return require(RS:WaitForChild("Packages", 5):WaitForChild("Net", 5):FindFirstChildWhichIsA("ModuleScript", true))
     end)
-    if not ok or type(mod) ~= "table" then return false end
+    if not ok or type(mod) ~= "table" then
+        _G.NetModuleReady = false
+        return false
+    end
     NetModule = mod
+    _G.NetModuleReady = true
     return true
 end
 
@@ -574,10 +767,13 @@ local function clearViz()
     table.clear(_vizParts)
 end
 local function vizLine(a, b, color)
+    if not S.DEBUG_VIZ then return end
     local d = b - a
     if d.Magnitude < 0.05 then return end
     local p = Instance.new("Part")
+    p.Name = "P"
     p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CastShadow = false
+    p.Archivable = false
     p.Material = Enum.Material.Neon; p.Color = color
     p.Size = Vector3.new(0.4, 0.4, d.Magnitude)
     p.CFrame = CFrame.new((a + b) / 2, b)
@@ -585,8 +781,11 @@ local function vizLine(a, b, color)
     _vizParts[#_vizParts + 1] = p
 end
 local function vizDot(pos, color, sz)
+    if not S.DEBUG_VIZ then return end
     local p = Instance.new("Part")
+    p.Name = "P"
     p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CastShadow = false
+    p.Archivable = false
     p.Shape = Enum.PartType.Ball; p.Material = Enum.Material.Neon; p.Color = color
     p.Size = Vector3.new(sz, sz, sz)
     p.Position = pos
@@ -594,6 +793,7 @@ local function vizDot(pos, color, sz)
     _vizParts[#_vizParts + 1] = p
 end
 local function vizPath(fromPos, waypoints)
+    if not S.DEBUG_VIZ then return end
     if #waypoints == 0 then return end
     vizDot(fromPos, Color3.fromRGB(255, 255, 255), 1.8)
     local prev = fromPos
@@ -819,39 +1019,34 @@ local function doClone()
     if not char or not hum then return false end
     local cloner
     for _ = 1, 60 do
-        cloner = char:FindFirstChild("Quantum Cloner") or (LP:FindFirstChild("Backpack") and LP.Backpack:FindFirstChild("Quantum Cloner"))
+        local bp = LP:FindFirstChildOfClass("Backpack")
+        cloner = char:FindFirstChild("Quantum Cloner") or (bp and bp:FindFirstChild("Quantum Cloner"))
         if cloner then break end
         task.wait(0.05)
     end
     if not cloner then return false end
-    if cloner.Parent ~= char then hum:EquipTool(cloner); task.wait(0.02) end
-    cloner:Activate()
+    if cloner.Parent ~= char then pcall(function() hum:EquipTool(cloner) end); task.wait(0.02) end
+    S.clickTool(cloner)
     local cloneName = tostring(LP.UserId) .. "_Clone"
     local clone = workspace:FindFirstChild(cloneName) or workspace:WaitForChild(cloneName, 3)
     if not clone then return false end
     task.wait(0.03)
     local tpButton
     for _ = 1, 80 do
-        local tf = LP.PlayerGui:FindFirstChild("ToolsFrames")
+        local pg = LP:FindFirstChildOfClass("PlayerGui")
+        local tf = pg and pg:FindFirstChild("ToolsFrames")
         local qc = tf and tf:FindFirstChild("QuantumCloner")
         tpButton = qc and qc:FindFirstChild("TeleportToClone")
         if tpButton then break end
         task.wait(0.05)
     end
     if not tpButton then return false end
-    tpButton.Visible = true
+    pcall(function() tpButton.Visible = true end)
     task.wait()
     local function fire()
-        if firesignal then
-            firesignal(tpButton.MouseButton1Up)
-        else
-            local vim = Instance.new("VirtualInputManager")
-            local inset = cloneref(game:GetService("GuiService")):GetGuiInset()
-            local p = tpButton.AbsolutePosition + (tpButton.AbsoluteSize / 2) + inset
-            vim:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 1)
-            task.wait()
-            vim:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 1)
-        end
+        if S.clickButton(tpButton) then return end
+        pcall(function() tpButton.Visible = true end)
+        S.clickButton(tpButton)
     end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local start = hrp and hrp.Position
@@ -913,41 +1108,32 @@ function _G.instantClone()
         local character = LP.Character or LP.CharacterAdded:Wait()
         local humanoid = character:FindFirstChildOfClass("Humanoid")
         if not humanoid then return end
-        local cloner = LP.Backpack:FindFirstChild("Quantum Cloner") or character:FindFirstChild("Quantum Cloner")
+        local bp = LP:FindFirstChildOfClass("Backpack")
+        local cloner = (bp and bp:FindFirstChild("Quantum Cloner")) or character:FindFirstChild("Quantum Cloner")
         if not cloner then return end
         if cloner.Parent ~= character then
-            humanoid:UnequipTools()
-            humanoid:EquipTool(cloner)
+            pcall(function() humanoid:UnequipTools() end)
+            pcall(function() humanoid:EquipTool(cloner) end)
             task.wait(0.02)
         end
-        for _ = 1, 3 do pcall(function() cloner:Activate() end) end
+        -- One activation; the old code fired it three times back to back, which
+        -- looks like spam on the server side.
+        pcall(function() cloner:Activate() end)
         local cloneName = tostring(LP.UserId) .. "_Clone"
         local deadline = os.clock() + 1.5
-        while os.clock() < deadline do
-            if workspace:FindFirstChild(cloneName) then break end
+        while os.clock() < deadline and not workspace:FindFirstChild(cloneName) do
             RunService.Heartbeat:Wait()
         end
         if cloneMethod == "Remote" then
             local r = _G.GetQuantumOnTeleportRemote and _G.GetQuantumOnTeleportRemote()
             if r then pcall(function() r:FireServer() end) end
         else
-            local tf = LP.PlayerGui:FindFirstChild("ToolsFrames")
+            local pg = LP:FindFirstChildOfClass("PlayerGui")
+            local tf = pg and pg:FindFirstChild("ToolsFrames")
             local qc = tf and tf:FindFirstChild("QuantumCloner")
             local btn = qc and qc:FindFirstChild("TeleportToClone")
             if btn then
-                if typeof(firesignal) == "function" then
-                    pcall(firesignal, btn.MouseButton1Up)
-                else
-                    local vim = Instance.new("VirtualInputManager")
-                    local inset = game:GetService("GuiService"):GetGuiInset()
-                    local cx = btn.AbsolutePosition.X + btn.AbsoluteSize.X * 0.5 + inset.X
-                    local cy = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y * 0.5 + inset.Y
-                    pcall(function()
-                        vim:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
-                        task.wait()
-                        vim:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
-                    end)
-                end
+                S.clickButton(btn)
             end
         end
     end)
@@ -979,48 +1165,52 @@ local function goToBrainrotAfterClone(targetPetData, toolName, landingDelay)
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum or hum.Health <= 0 then return end
-    local tool = LP.Backpack:FindFirstChild(toolName) or char:FindFirstChild(toolName)
+    local bp = LP:FindFirstChildOfClass("Backpack")
+    local tool = (bp and bp:FindFirstChild(toolName)) or char:FindFirstChild(toolName)
     if tool then hum:EquipTool(tool) end
     task.wait(0.3)
     local targetPart = findAdorneeGlobal(targetPetData)
     if not targetPart then return end
-    local verticalDiff = targetPart.Position.Y - hrp.Position.Y
-    if verticalDiff > 4 then
-        local destPos = Vector3.new(targetPart.Position.X, targetPart.Position.Y - 5, targetPart.Position.Z)
-        local plat = Instance.new("Part")
-        plat.Size = Vector3.new(8, 1, 8)
-        plat.Anchored = true
-        plat.CanCollide = true
-        plat.Transparency = 1
-        plat.CFrame = CFrame.new(destPos - Vector3.new(0, 3.35, 0))
-        plat.Parent = Workspace
-        pcall(function() hum.PlatformStand = true end)
+
+    -- Descent without inserting anything into the world. The old version spawned
+    -- invisible anchored parts in workspace and left them there for 20s; a server
+    -- scan for foreign parts finds them instantly. Anchoring the root locally and
+    -- tweening it down gives the same result with no new instance.
+    local function descendTo(destPos)
         local dist = (destPos - hrp.Position).Magnitude
-        if dist >= 1 then
-            local duration = math.clamp(dist / 110, 0.15, 0.7)
-            TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Quad), { CFrame = CFrame.new(destPos) }):Play()
-            task.wait(duration + 0.15)
+        local duration = math.clamp(dist / 110, 0.12, 0.65)
+        pcall(function() hum.PlatformStand = true end)
+        pcall(function()
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+        local anchored = pcall(function() hrp.Anchored = true end)
+        if anchored then
+            local tween = TweenService:Create(
+                hrp,
+                TweenInfo.new(duration, Enum.EasingStyle.Quad),
+                { CFrame = CFrame.new(destPos) }
+            )
+            tween:Play()
+            task.wait(duration + 0.05)
+        else
+            pcall(function() hrp.CFrame = CFrame.new(destPos) end)
         end
+        pcall(function() hrp.Anchored = false end)
         pcall(function() hum.PlatformStand = false end)
-        task.spawn(function() task.wait(20) plat:Destroy() end)
-    elseif verticalDiff > 2 then
-        local airPos = Vector3.new(targetPart.Position.X, targetPart.Position.Y - 5, targetPart.Position.Z)
-        local plat = Instance.new("Part")
-        plat.Size = Vector3.new(3, 1, 3)
-        plat.Position = airPos - Vector3.new(0, 5, 0)
-        plat.Anchored = true
-        plat.CanCollide = true
-        plat.Transparency = 1
-        plat.Parent = Workspace
-        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-        task.wait(0.07)
-        hrp.CFrame = CFrame.new(airPos)
-        task.spawn(function() task.wait(20) plat:Destroy() end)
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+        pcall(function()
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    local verticalDiff = targetPart.Position.Y - hrp.Position.Y
+    if verticalDiff > 2 then
+        descendTo(Vector3.new(targetPart.Position.X, targetPart.Position.Y - 5, targetPart.Position.Z))
     else
         if (hrp.Position - targetPart.Position).Magnitude > 3 then
-            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-            task.wait(0.07)
-            hrp.CFrame = CFrame.new(targetPart.Position)
+            descendTo(targetPart.Position)
         end
     end
     task.wait(landingDelay or 0.48)
@@ -1058,9 +1248,15 @@ local function doVelocityTP()
     if not closestData or not skyKey then _G.TPStatus = "no_sky_platform"; warn("[TP] no_sky_platform"); isTeleporting = false; return end
     local destPos = closestData.coord
     local maxHP = hum.MaxHealth
-    hum.Health = maxHP
+    -- Only write when the value actually changes: re-asserting MaxHealth every
+    -- single frame is a behavioural tell.
+    if hum.Health < maxHP then pcall(function() hum.Health = maxHP end) end
+    local healTicks = 0
     local healConn = RunService.Heartbeat:Connect(function()
-        if hum and hum.Parent then hum.Health = maxHP end
+        if not hum or not hum.Parent then return end
+        healTicks = healTicks + 1
+        if healTicks % 6 ~= 0 then return end
+        if hum.Health < hum.MaxHealth then pcall(function() hum.Health = hum.MaxHealth end) end
     end)
     local _carpet = carpetEngage()
     _G.TPStatus = _carpet and ("carpet:" .. _carpet) or "NO_carpet"
@@ -1119,12 +1315,9 @@ local function doVelocityTP()
         _G.TPStatus = "clone_ok"
         task.wait(0.1)
         goToBrainrotAfterClone(pet, "Grapple Hook", (_G.LandingDelay or 300) / 1000)
-        pcall(function()
-            local vim = Instance.new("VirtualInputManager")
-            vim:SendKeyEvent(true, Enum.KeyCode.C, false, game)
-            task.wait(0.05)
-            vim:SendKeyEvent(false, Enum.KeyCode.C, false, game)
-        end)
+        -- Was SendKeyEvent(Enum.KeyCode.C): a synthetic key press through the
+        -- engine input service. The intent is simply "fire the grapple".
+        task.spawn(function() S.fireGrappleSafe() end)
         task.wait(0.1)
         local _fhrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         if _fhrp and _fhrp.Parent then
@@ -1169,9 +1362,15 @@ local function doTPtoPet(pet)
     if not closestData or not skyKey then _G.TPStatus = "no_sky_platform"; warn("[TP] no_sky_platform"); isTeleporting = false; return end
     local destPos = closestData.coord
     local maxHP = hum.MaxHealth
-    hum.Health = maxHP
+    -- Only write when the value actually changes: re-asserting MaxHealth every
+    -- single frame is a behavioural tell.
+    if hum.Health < maxHP then pcall(function() hum.Health = maxHP end) end
+    local healTicks = 0
     local healConn = RunService.Heartbeat:Connect(function()
-        if hum and hum.Parent then hum.Health = maxHP end
+        if not hum or not hum.Parent then return end
+        healTicks = healTicks + 1
+        if healTicks % 6 ~= 0 then return end
+        if hum.Health < hum.MaxHealth then pcall(function() hum.Health = hum.MaxHealth end) end
     end)
     local _carpet = carpetEngage()
     _G.TPStatus = _carpet and ("carpet:" .. _carpet) or "NO_carpet"
@@ -1230,12 +1429,9 @@ local function doTPtoPet(pet)
         _G.TPStatus = "clone_ok"
         task.wait(0.1)
         goToBrainrotAfterClone(pet, "Grapple Hook", (_G.LandingDelay or 300) / 1000)
-        pcall(function()
-            local vim = Instance.new("VirtualInputManager")
-            vim:SendKeyEvent(true, Enum.KeyCode.C, false, game)
-            task.wait(0.05)
-            vim:SendKeyEvent(false, Enum.KeyCode.C, false, game)
-        end)
+        -- Was SendKeyEvent(Enum.KeyCode.C): a synthetic key press through the
+        -- engine input service. The intent is simply "fire the grapple".
+        task.spawn(function() S.fireGrappleSafe() end)
         task.wait(0.1)
         local _fhrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         if _fhrp and _fhrp.Parent then
@@ -1282,16 +1478,39 @@ local function getMutColor(mut)
     return MUT_COLORS[mut] or Color3.fromRGB(255, 80, 80)
 end
 
+-- FIX: the old version resolved `(gethui and gethui())` for the progress bar and
+-- then called :Destroy() on it, which destroyed the executor's whole hidden UI
+-- container. The menu was then parented into that dead container and never
+-- rendered. It also touched CoreGui outside of a pcall, so an executor that
+-- blocks CoreGui killed the script before the menu was built.
 local function cleanupOldGui()
-    local cg = (gethui and gethui()) or game:GetService("CoreGui")
-    local old = cg:FindFirstChild("SkiddedBrainrotTP")
-    if old then old:Destroy() end
-    local oldBar = (gethui and gethui()) or game:GetService("CoreGui"):FindFirstChild("StealProgressBar")
-    if oldBar then oldBar:Destroy() end
-    local oldEsp = workspace:FindFirstChild("BrainrotESP")
-    if oldEsp then oldEsp:Destroy() end
+    local containers = {}
+    local function addContainer(c)
+        if c then
+            for _, existing in ipairs(containers) do
+                if existing == c then return end
+            end
+            containers[#containers + 1] = c
+        end
+    end
+    pcall(function() addContainer(S.hiddenRoot()) end)
+    pcall(function() addContainer(game:GetService("CoreGui")) end)
+    pcall(function() addContainer(LP:FindFirstChildOfClass("PlayerGui")) end)
+
+    local stale = { "SkiddedBrainrotTP", "StealProgressBar", "Fx" }
+    for _, container in ipairs(containers) do
+        for _, name in ipairs(stale) do
+            local old
+            pcall(function() old = container:FindFirstChild(name) end)
+            if old then pcall(function() old:Destroy() end) end
+        end
+    end
+    for _, name in ipairs({ "BrainrotESP", "SkiddedViz", "PathViz" }) do
+        local old = workspace:FindFirstChild(name)
+        if old then pcall(function() old:Destroy() end) end
+    end
 end
-cleanupOldGui()
+pcall(cleanupOldGui)
 
 local U = {
     BG = Color3.fromRGB(0, 0, 0),
@@ -1305,25 +1524,34 @@ local U = {
     MUT = Color3.fromRGB(132, 138, 154),
     KNOB = Color3.fromRGB(245, 247, 252),
     WHITE = Color3.fromRGB(255, 255, 255),
-    FILE = "SkiddedBrainrotTP.json",
+    FILE = "cfg_state.json",
 }
 local PAD = 10
 
+local SG_ROOT = S.hiddenRoot()
+
 local sg = Instance.new("ScreenGui")
-sg.Name = "SkiddedBrainrotTP"
+sg.Name = "Panel"
 sg.ResetOnSpawn = false
 sg.IgnoreGuiInset = true
+sg.DisplayOrder = 999
 sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-local okSg = pcall(function() sg.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
-if not okSg or not sg.Parent then sg.Parent = LP:WaitForChild("PlayerGui") end
+local okSg = pcall(function() sg.Parent = SG_ROOT end)
+if not okSg or not sg.Parent then
+    pcall(function() sg.Parent = LP:FindFirstChildOfClass("PlayerGui") end)
+end
+S.protect(sg)
 
 local progressBarGui = Instance.new("ScreenGui")
-progressBarGui.Name = "StealProgressBar"
+progressBarGui.Name = "Hud"
 progressBarGui.ResetOnSpawn = false
 progressBarGui.IgnoreGuiInset = true
 progressBarGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-local okPb = pcall(function() progressBarGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
-if not okPb or not progressBarGui.Parent then progressBarGui.Parent = LP:WaitForChild("PlayerGui") end
+local okPb = pcall(function() progressBarGui.Parent = SG_ROOT end)
+if not okPb or not progressBarGui.Parent then
+    pcall(function() progressBarGui.Parent = LP:FindFirstChildOfClass("PlayerGui") end)
+end
+S.protect(progressBarGui)
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
@@ -1573,7 +1801,7 @@ logoText.TextYAlignment = Enum.TextYAlignment.Center
     title.Size = UDim2.new(1, -120, 1, 0)
     title.Position = UDim2.new(0, 30, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "Skidded Brainrot TP"
+    title.Text = "Brainrot TP"
     title.TextColor3 = U.WHITE
     title.Font = Enum.Font.GothamBold
     title.TextSize = 12
@@ -1594,263 +1822,136 @@ statusBar.Parent = header
 
 H.cap(33, "MOVEMENT")
 
-local speedRow = H.row(46, 28)
-local speedLbl = H.lbl(speedRow, 110, "Speed: 400")
-local sliderTrack, sliderFill, sliderKnob = H.track(speedRow)
-local SPEED_MIN, SPEED_MAX = 50, 950
-local sliderDragging = false
-local function updateSpeedFromAlpha(alpha)
-    alpha = math.clamp(alpha, 0, 1)
-    local spd = math.floor(SPEED_MIN + alpha * (SPEED_MAX - SPEED_MIN))
-    _G.VanishCarpetSpeed = spd
-    speedLbl.Text = "Speed: " .. spd
-    sliderFill.Size = UDim2.new(alpha, 0, 1, 0)
-    sliderKnob.Position = UDim2.new(alpha, 0, 0.5, 0)
-    _G.SavedConfig = _G.SavedConfig or {}
-    _G.SavedConfig.CarpetSpeed = spd
-end
-local _initCarpetSpeed = (_G.SavedConfig and tonumber(_G.SavedConfig.CarpetSpeed)) or 400
-updateSpeedFromAlpha((_initCarpetSpeed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN))
+-- Sliders are built from a spec table instead of one local per widget. The main
+-- chunk has to stay under Luau's 200-active-local limit, so a dozen widget
+-- locals per slider is not affordable.
+local SLIDERS = {}
+local function makeSlider(spec)
+    local row = H.row(spec.y, 28)
+    local lbl = H.lbl(row, spec.lblW or 110, spec.header)
 
-sliderKnob.MouseButton1Down:Connect(function() sliderDragging = true end)
-UIS.InputChanged:Connect(function(inp)
-    if not sliderDragging then return end
-    if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
-        local trackAbs = sliderTrack.AbsolutePosition
-        local trackW = sliderTrack.AbsoluteSize.X
-        local alpha = (inp.Position.X - trackAbs.X) / trackW
-        updateSpeedFromAlpha(alpha)
-    end
-end)
-UIS.InputEnded:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        sliderDragging = false
-    end
-end)
-sliderTrack.InputBegan:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        sliderDragging = true
-        local alpha = (inp.Position.X - sliderTrack.AbsolutePosition.X) / sliderTrack.AbsoluteSize.X
-        updateSpeedFromAlpha(alpha)
-    end
-end)
-
-local joinDelayRow = H.row(78, 28)
-local joinDelayLbl = H.lbl(joinDelayRow, 110, "Join: 5000ms")
-local joinSliderTrack, joinSliderFill, joinSliderKnob = H.track(joinDelayRow)
-local JOIN_DELAY_MIN, JOIN_DELAY_MAX = 0, 15000
-local joinDelayDragging = false
-local function updateJoinDelayFromAlpha(alpha)
-    alpha = math.clamp(alpha, 0, 1)
-    local delayMs = math.floor(JOIN_DELAY_MIN + alpha * (JOIN_DELAY_MAX - JOIN_DELAY_MIN))
-    _G.JoinDelay = delayMs
-    joinDelayLbl.Text = "Join: " .. delayMs .. "ms"
-    joinSliderFill.Size = UDim2.new(alpha, 0, 1, 0)
-    joinSliderKnob.Position = UDim2.new(alpha, 0, 0.5, 0)
-    _G.SavedConfig = _G.SavedConfig or {}
-    _G.SavedConfig.JoinDelay = delayMs
-end
-local _initJoinDelay = (_G.SavedConfig and tonumber(_G.SavedConfig.JoinDelay)) or 5000
-updateJoinDelayFromAlpha((_initJoinDelay - JOIN_DELAY_MIN) / (JOIN_DELAY_MAX - JOIN_DELAY_MIN))
-
-joinSliderKnob.MouseButton1Down:Connect(function() joinDelayDragging = true end)
-UIS.InputChanged:Connect(function(inp)
-    if not joinDelayDragging then return end
-    if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
-        local trackAbs = joinSliderTrack.AbsolutePosition
-        local trackW = joinSliderTrack.AbsoluteSize.X
-        local alpha = (inp.Position.X - trackAbs.X) / trackW
-        updateJoinDelayFromAlpha(alpha)
-    end
-end)
-UIS.InputEnded:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        joinDelayDragging = false
-    end
-end)
-joinSliderTrack.InputBegan:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        joinDelayDragging = true
-        local alpha = (inp.Position.X - joinSliderTrack.AbsolutePosition.X) / joinSliderTrack.AbsoluteSize.X
-        updateJoinDelayFromAlpha(alpha)
-    end
-end)
-
-local landingDelayRow = H.row(110, 28)
-local landingDelayLbl = H.lbl(landingDelayRow, 110, "Land: 300ms")
-local landingSliderTrack, landingSliderFill, landingSliderKnob = H.track(landingDelayRow)
-local LANDING_DELAY_MIN, LANDING_DELAY_MAX = 0, 3000
-local landingDelayDragging = false
-local function updateLandingDelayFromAlpha(alpha)
-    alpha = math.clamp(alpha, 0, 1)
-    local delayMs = math.floor(LANDING_DELAY_MIN + alpha * (LANDING_DELAY_MAX - LANDING_DELAY_MIN))
-    _G.LandingDelay = delayMs
-    landingDelayLbl.Text = "Land: " .. delayMs .. "ms"
-    landingSliderFill.Size = UDim2.new(alpha, 0, 1, 0)
-    landingSliderKnob.Position = UDim2.new(alpha, 0, 0.5, 0)
-    _G.SavedConfig = _G.SavedConfig or {}
-    _G.SavedConfig.LandingDelay = delayMs
-end
-local _initLandingDelay = (_G.SavedConfig and tonumber(_G.SavedConfig.LandingDelay)) or 300
-updateLandingDelayFromAlpha((_initLandingDelay - LANDING_DELAY_MIN) / (LANDING_DELAY_MAX - LANDING_DELAY_MIN))
-
-landingSliderKnob.MouseButton1Down:Connect(function() landingDelayDragging = true end)
-UIS.InputChanged:Connect(function(inp)
-    if not landingDelayDragging then return end
-    if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
-        local trackAbs = landingSliderTrack.AbsolutePosition
-        local trackW = landingSliderTrack.AbsoluteSize.X
-        local alpha = (inp.Position.X - trackAbs.X) / trackW
-        updateLandingDelayFromAlpha(alpha)
-    end
-end)
-UIS.InputEnded:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        landingDelayDragging = false
-    end
-end)
-landingSliderTrack.InputBegan:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        landingDelayDragging = true
-        local alpha = (inp.Position.X - landingSliderTrack.AbsolutePosition.X) / landingSliderTrack.AbsoluteSize.X
-        updateLandingDelayFromAlpha(alpha)
-    end
-end)
-
-H.cap(142, "TELEPORT")
-
-local cloneRow = H.row(156, 28)
-local cloneLbl = H.lbl(cloneRow, 100, "Clone: Remote")
-local cloneToggle = Instance.new("TextButton")
-cloneToggle.Size = UDim2.new(0, 128, 0, 22)
-cloneToggle.Position = UDim2.new(1, -132, 0.5, -11)
-cloneToggle.BackgroundColor3 = U.ACC_DIM
-cloneToggle.BorderSizePixel = 0
-cloneToggle.AutoButtonColor = true
-cloneToggle.Text = "Method: Remote"
-cloneToggle.TextColor3 = U.WHITE
-cloneToggle.Font = Enum.Font.GothamBold
-cloneToggle.TextSize = 9
-cloneToggle.Parent = cloneRow
-H.corner(cloneToggle, 6)
-cloneToggle.MouseButton1Click:Connect(function()
-    if cloneMethod == "Remote" then
-        cloneMethod = "FireSignal"
-        cloneToggle.Text = "Method: FireSignal"
-        cloneLbl.Text = "Clone: FireSignal"
+    local track, fill, knob
+    if spec.plain then
+        track = Instance.new("Frame")
+        track.Size = UDim2.new(1, -116, 0, 5)
+        track.Position = UDim2.new(0, 66, 0.5, -2)
+        track.BackgroundColor3 = U.TRACK
+        track.BorderSizePixel = 0
+        track.Parent = row
+        H.corner(track, 3)
+        fill = Instance.new("Frame")
+        fill.Size = UDim2.new(0.3, 0, 1, 0)
+        fill.BackgroundColor3 = U.ACC
+        fill.BorderSizePixel = 0
+        fill.Parent = track
+        H.corner(fill, 3)
+        knob = Instance.new("TextButton")
+        knob.Size = UDim2.new(0, 14, 0, 14)
+        knob.AnchorPoint = Vector2.new(0.5, 0.5)
+        knob.Position = UDim2.new(0.3, 0, 0.5, 0)
+        knob.BackgroundColor3 = U.KNOB
+        knob.BorderSizePixel = 0
+        knob.AutoButtonColor = false
+        knob.Text = ""
+        knob.ZIndex = 5
+        knob.Parent = track
+        H.corner(knob, 7)
+        H.stroke(knob, U.ACC, 2, 0)
     else
-        cloneMethod = "Remote"
-        cloneToggle.Text = "Method: Remote"
-        cloneLbl.Text = "Clone: Remote"
+        track, fill, knob = H.track(row)
     end
-    _G.CloneMethod = cloneMethod
-    _G.SavedConfig = _G.SavedConfig or {}
-    _G.SavedConfig.CloneMethod = cloneMethod
-end)
 
-local stealRow = H.row(188, 28)
-local stealModeLbl = H.lbl(stealRow, 86, "Steal: Nearest")
-local stealToggle = Instance.new("TextButton")
-stealToggle.Size = UDim2.new(0, 40, 0, 22)
-stealToggle.Position = UDim2.new(0, 100, 0.5, -11)
-stealToggle.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-stealToggle.BorderSizePixel = 0
-stealToggle.AutoButtonColor = true
-stealToggle.Text = "ON"
-stealToggle.TextColor3 = U.WHITE
-stealToggle.Font = Enum.Font.GothamBold
-stealToggle.TextSize = 9
-stealToggle.Parent = stealRow
-H.corner(stealToggle, 6)
-local stealModeToggle = Instance.new("TextButton")
-stealModeToggle.Size = UDim2.new(0, 100, 0, 22)
-stealModeToggle.Position = UDim2.new(1, -100, 0.5, -11)
-stealModeToggle.BackgroundColor3 = U.ACC_DIM
-stealModeToggle.BorderSizePixel = 0
-stealModeToggle.AutoButtonColor = true
-stealModeToggle.Text = "Mode: Nearest"
-stealModeToggle.TextColor3 = U.WHITE
-stealModeToggle.Font = Enum.Font.GothamBold
-stealModeToggle.TextSize = 9
-stealModeToggle.Parent = stealRow
-H.corner(stealModeToggle, 6)
+    local valueLbl = lbl
+    if spec.valueLabel then
+        valueLbl = Instance.new("TextLabel")
+        valueLbl.Size = UDim2.new(0, 34, 1, 0)
+        valueLbl.Position = UDim2.new(1, -42, 0, 0)
+        valueLbl.BackgroundTransparency = 1
+        valueLbl.Text = ""
+        valueLbl.TextColor3 = U.ACC
+        valueLbl.Font = Enum.Font.GothamBold
+        valueLbl.TextSize = 10
+        valueLbl.TextXAlignment = Enum.TextXAlignment.Right
+        valueLbl.Parent = row
+    end
 
-local radiusRow = H.row(220, 28)
-H.lbl(radiusRow, 50, "Radius")
-local stealRadiusSlider = Instance.new("Frame")
-stealRadiusSlider.Size = UDim2.new(1, -116, 0, 5)
-stealRadiusSlider.Position = UDim2.new(0, 66, 0.5, -2)
-stealRadiusSlider.BackgroundColor3 = U.TRACK
-stealRadiusSlider.BorderSizePixel = 0
-stealRadiusSlider.Parent = radiusRow
-H.corner(stealRadiusSlider, 3)
-local stealRadiusFill = Instance.new("Frame")
-stealRadiusFill.Size = UDim2.new(0.3, 0, 1, 0)
-stealRadiusFill.BackgroundColor3 = U.ACC
-stealRadiusFill.BorderSizePixel = 0
-stealRadiusFill.Parent = stealRadiusSlider
-H.corner(stealRadiusFill, 3)
-local stealRadiusKnob = Instance.new("TextButton")
-stealRadiusKnob.Size = UDim2.new(0, 14, 0, 14)
-stealRadiusKnob.AnchorPoint = Vector2.new(0.5, 0.5)
-stealRadiusKnob.Position = UDim2.new(0.3, 0, 0.5, 0)
-stealRadiusKnob.BackgroundColor3 = U.KNOB
-stealRadiusKnob.BorderSizePixel = 0
-stealRadiusKnob.AutoButtonColor = false
-stealRadiusKnob.Text = ""
-stealRadiusKnob.ZIndex = 5
-stealRadiusKnob.Parent = stealRadiusSlider
-H.corner(stealRadiusKnob, 7)
-H.stroke(stealRadiusKnob, U.ACC, 2, 0)
-local stealRadiusLbl = Instance.new("TextLabel")
-stealRadiusLbl.Size = UDim2.new(0, 34, 1, 0)
-stealRadiusLbl.Position = UDim2.new(1, -42, 0, 0)
-stealRadiusLbl.BackgroundTransparency = 1
-stealRadiusLbl.Text = "15"
-stealRadiusLbl.TextColor3 = U.ACC
-stealRadiusLbl.Font = Enum.Font.GothamBold
-stealRadiusLbl.TextSize = 10
-stealRadiusLbl.TextXAlignment = Enum.TextXAlignment.Right
-stealRadiusLbl.Parent = radiusRow
-local STEAL_RADIUS_MIN, STEAL_RADIUS_MAX = 5, 30
-local stealRadiusDragging = false
-local stealRadiusValue = 15
-local function updateStealRadiusFromAlpha(alpha)
-    alpha = math.clamp(alpha, 0, 1)
-    local radius = math.floor(STEAL_RADIUS_MIN + alpha * (STEAL_RADIUS_MAX - STEAL_RADIUS_MIN))
-    stealRadiusValue = radius
-    stealRadiusLbl.Text = tostring(radius)
-    stealRadiusFill.Size = UDim2.new(alpha, 0, 1, 0)
-    stealRadiusKnob.Position = UDim2.new(alpha, 0, 0.5, 0)
-    _G.StealRadius = radius
-    _G.SavedConfig = _G.SavedConfig or {}
-    _G.SavedConfig.StealRadius = radius
+    local s = { track = track, fill = fill, knob = knob, minV = spec.minV, maxV = spec.maxV, dragging = false, value = spec.initial }
+    function s.set(alpha)
+        alpha = math.clamp(alpha, 0, 1)
+        local v = math.floor(s.minV + alpha * (s.maxV - s.minV))
+        s.value = v
+        spec.onValue(v)
+        valueLbl.Text = spec.fmt(v)
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+        _G.SavedConfig = _G.SavedConfig or {}
+        _G.SavedConfig[spec.key] = v
+    end
+    function s.setRaw(v)
+        v = math.clamp(tonumber(v) or spec.initial, s.minV, s.maxV)
+        s.set((v - s.minV) / (s.maxV - s.minV))
+    end
+
+    knob.MouseButton1Down:Connect(function() s.dragging = true end)
+    track.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+            s.dragging = true
+            s.set((inp.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X)
+        end
+    end)
+
+    SLIDERS[#SLIDERS + 1] = s
+    s.setRaw(spec.initial)
+    return s
 end
-local _initStealRadius = (_G.SavedConfig and tonumber(_G.SavedConfig.StealRadius)) or 15
-updateStealRadiusFromAlpha((_initStealRadius - STEAL_RADIUS_MIN) / (STEAL_RADIUS_MAX - STEAL_RADIUS_MIN))
 
-stealRadiusKnob.MouseButton1Down:Connect(function() stealRadiusDragging = true end)
+-- One shared input handler for all sliders instead of two connections each.
 UIS.InputChanged:Connect(function(inp)
-    if not stealRadiusDragging then return end
-    if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
-        local trackAbs = stealRadiusSlider.AbsolutePosition
-        local trackW = stealRadiusSlider.AbsoluteSize.X
-        local alpha = (inp.Position.X - trackAbs.X) / trackW
-        updateStealRadiusFromAlpha(alpha)
+    if inp.UserInputType ~= Enum.UserInputType.MouseMovement and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+    for _, s in ipairs(SLIDERS) do
+        if s.dragging then
+            local ok, ax = pcall(function() return s.track.AbsolutePosition.X end)
+            if ok then
+                local w = s.track.AbsoluteSize.X
+                if w > 0 then s.set((inp.Position.X - ax) / w) end
+            end
+        end
     end
 end)
 UIS.InputEnded:Connect(function(inp)
     if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        stealRadiusDragging = false
+        for _, s in ipairs(SLIDERS) do s.dragging = false end
     end
 end)
-stealRadiusSlider.InputBegan:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        stealRadiusDragging = true
-        local alpha = (inp.Position.X - stealRadiusSlider.AbsolutePosition.X) / stealRadiusSlider.AbsoluteSize.X
-        updateStealRadiusFromAlpha(alpha)
-    end
-end)
+
+local speedSlider = makeSlider({
+    y = 46, header = "Speed: 400", key = "CarpetSpeed",
+    minV = 50, maxV = 950,
+    initial = (_G.SavedConfig and tonumber(_G.SavedConfig.CarpetSpeed)) or 400,
+    fmt = function(v) return "Speed: " .. v end,
+    onValue = function(v) _G.VanishCarpetSpeed = v end,
+})
+local joinSlider = makeSlider({
+    y = 78, header = "Join: 5000ms", key = "JoinDelay",
+    minV = 0, maxV = 15000,
+    initial = (_G.SavedConfig and tonumber(_G.SavedConfig.JoinDelay)) or 5000,
+    fmt = function(v) return "Join: " .. v .. "ms" end,
+    onValue = function(v) _G.JoinDelay = v end,
+})
+local landingSlider = makeSlider({
+    y = 110, header = "Land: 300ms", key = "LandingDelay",
+    minV = 0, maxV = 3000,
+    initial = (_G.SavedConfig and tonumber(_G.SavedConfig.LandingDelay)) or 300,
+    fmt = function(v) return "Land: " .. v .. "ms" end,
+    onValue = function(v) _G.LandingDelay = v end,
+})
+local radiusSlider = makeSlider({
+    y = 220, lblW = 50, header = "Radius", plain = true, valueLabel = true,
+    key = "StealRadius", minV = 5, maxV = 30,
+    initial = (_G.SavedConfig and tonumber(_G.SavedConfig.StealRadius)) or 15,
+    fmt = function(v) return tostring(v) end,
+    onValue = function(v) _G.StealRadius = v end,
+})
 
 H.cap(252, "PROTECTION")
 
@@ -1959,11 +2060,18 @@ listPad.Parent = scrollFrame
 
 do
     local sc = _G.SavedConfig
-    if sc and type(sc.MainPos) == "table" and #sc.MainPos == 4 then
-        mainFrame.Position = UDim2.new(sc.MainPos[1], sc.MainPos[2], sc.MainPos[3], sc.MainPos[4])
+    local function applyPos(frame, pos)
+        if type(pos) ~= "table" or #pos ~= 4 then return end
+        for i = 1, 4 do
+            if type(pos[i]) ~= "number" then return end
+        end
+        pcall(function()
+            frame.Position = UDim2.new(pos[1], pos[2], pos[3], pos[4])
+        end)
     end
-    if sc and type(sc.SelectorPos) == "table" and #sc.SelectorPos == 4 then
-        selectorFrame.Position = UDim2.new(sc.SelectorPos[1], sc.SelectorPos[2], sc.SelectorPos[3], sc.SelectorPos[4])
+    if sc then
+        applyPos(mainFrame, sc.MainPos)
+        applyPos(selectorFrame, sc.SelectorPos)
     end
 end
 
@@ -2200,6 +2308,12 @@ end)
 
 local InternalStealCache = {}
 local function buildStealCallbacks(prompt)
+    S._promptPrune = (S._promptPrune or 0) + 1
+    if S._promptPrune % 40 == 0 then
+        for p in pairs(InternalStealCache) do
+            if not p.Parent then InternalStealCache[p] = nil end
+        end
+    end
     if InternalStealCache[prompt] then return end
     local data = { holdCallbacks = {}, triggerCallbacks = {}, ready = true }
     local ok1, conns1 = pcall(getconnections, prompt.PromptButtonHoldBegan)
@@ -2258,7 +2372,40 @@ local function executeGrabAsync(prompt, targetPet)
     if not prompt or not prompt.Parent then return false end
     buildStealCallbacks(prompt)
     local data = InternalStealCache[prompt]
-    if not data or not data.ready then return false end
+    if not data or not data.ready then
+        if data then return false end
+        -- getconnections is missing or returned nothing on this executor. Drive
+        -- the prompt through the engine path instead; the server still validates
+        -- the distance, so this only fires when the client is actually in range.
+        if grabState.active then return false end
+        grabState.active = true
+        grabState.startTime = tick()
+        grabState.phase = "waitingRange"
+        grabState.label = targetPet.name or "Animal"
+        task.spawn(function()
+            local fired = false
+            while tick() - grabState.startTime <= GRAB_CONFIG.HOLD_MAX do
+                if not prompt.Parent then break end
+                if petGrabDist(targetPet) <= radiusSlider.value then
+                    fired = S.firePrompt(prompt)
+                    if fired then break end
+                end
+                task.wait(0.05)
+            end
+            if fired then
+                grabState.totalSteals = grabState.totalSteals + 1
+                grabState.lastResult = "Stole " .. grabState.label
+            else
+                grabState.failedSteals = grabState.failedSteals + 1
+                grabState.lastResult = "Missed " .. grabState.label
+            end
+            grabState.active = false
+            grabState.phase = "idle"
+            grabState.lastResultTime = tick()
+            task.wait(GRAB_CONFIG.COOLDOWN)
+        end)
+        return true
+    end
     data.ready = false
     grabState.active = true
     grabState.startTime = tick()
@@ -2268,13 +2415,13 @@ local function executeGrabAsync(prompt, targetPet)
         for _, fn in ipairs(data.holdCallbacks) do task.spawn(fn) end
         task.wait(GRAB_CONFIG.HOLD_MIN)
         grabState.phase = "waitingRange"
-        local alreadyInRange = petGrabDist(targetPet) <= stealRadiusValue
+        local alreadyInRange = petGrabDist(targetPet) <= radiusSlider.value
         local fired = false
         while true do
             local elapsed = tick() - grabState.startTime
             if elapsed > GRAB_CONFIG.HOLD_MAX then break end
             if not prompt.Parent then break end
-            if petGrabDist(targetPet) <= stealRadiusValue then
+            if petGrabDist(targetPet) <= radiusSlider.value then
                 if not alreadyInRange then task.wait(GRAB_CONFIG.ENTRY_DELAY) end
                 for _, fn in ipairs(data.triggerCallbacks) do task.spawn(fn) end
                 fired = true
@@ -2655,7 +2802,7 @@ end
 
 local function createBrainrotBillboard(data)
     local bb = Instance.new("BillboardGui")
-    bb.Name = "BrainrotESP_" .. tostring(data.uid)
+    bb.Name = "Tag_" .. tostring(data.uid)
     bb.Size = UDim2.new(0, 210, 0, 46)
     bb.StudsOffset = Vector3.new(0, 7, 0)
     bb.AlwaysOnTop = true
@@ -2738,8 +2885,12 @@ local function refreshBrainrotESP()
     local cache = scanAllPets()
     if not cache or #cache == 0 then return end
     if not brainrotESPFolder or not brainrotESPFolder.Parent then
-        brainrotESPFolder = Instance.new("Folder", workspace)
-        brainrotESPFolder.Name = "BrainrotESP"
+        -- Client-only container: billboards/highlights with Adornee render fine
+        -- from the hidden UI root and are invisible to workspace scans.
+        brainrotESPFolder = Instance.new("Folder")
+        brainrotESPFolder.Name = "Fx"
+        local root = S.visualRoot()
+        pcall(function() brainrotESPFolder.Parent = root end)
     end
     local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
     local entries = {}
@@ -2766,7 +2917,7 @@ local function refreshBrainrotESP()
                 bb.Adornee = data.adornee
                 bb.Parent = brainrotESPFolder
                 local hl = Instance.new("Highlight")
-                hl.Name = "BrainrotHL_" .. data.uid
+                hl.Name = "H_" .. data.uid
                 hl.Adornee = data.adornee
                 hl.FillColor = Color3.fromRGB(255,200,0)
                 hl.FillTransparency = 0.5
@@ -3012,13 +3163,13 @@ end)
 
 task.spawn(function()
     if _G.SavedConfig then
-        if _G.SavedConfig.CarpetSpeed then _G.VanishCarpetSpeed = _G.SavedConfig.CarpetSpeed; updateSpeedFromAlpha((_G.SavedConfig.CarpetSpeed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)) end
-        if _G.SavedConfig.JoinDelay then _G.JoinDelay = _G.SavedConfig.JoinDelay; updateJoinDelayFromAlpha(_G.SavedConfig.JoinDelay / JOIN_DELAY_MAX) end
-        if _G.SavedConfig.LandingDelay then _G.LandingDelay = _G.SavedConfig.LandingDelay; updateLandingDelayFromAlpha(_G.SavedConfig.LandingDelay / LANDING_DELAY_MAX) end
+        if _G.SavedConfig.CarpetSpeed then speedSlider.setRaw(_G.SavedConfig.CarpetSpeed) end
+        if _G.SavedConfig.JoinDelay then joinSlider.setRaw(_G.SavedConfig.JoinDelay) end
+        if _G.SavedConfig.LandingDelay then landingSlider.setRaw(_G.SavedConfig.LandingDelay) end
         if _G.SavedConfig.CloneMethod then cloneMethod = _G.SavedConfig.CloneMethod; if cloneMethod == "Remote" then cloneToggle.Text = "Method: Remote"; cloneLbl.Text = "Clone: Remote" else cloneToggle.Text = "Method: FireSignal"; cloneLbl.Text = "Clone: FireSignal" end end
         if _G.SavedConfig.StealEnabled then stealEnabled = _G.SavedConfig.StealEnabled; stealToggle.Text = stealEnabled and "ON" or "OFF"; stealToggle.BackgroundColor3 = stealEnabled and Color3.fromRGB(200,50,50) or Color3.fromRGB(170,0,0) end
         if _G.SavedConfig.StealMode then stealMode = _G.SavedConfig.StealMode; if stealMode == "Nearest" then stealModeToggle.Text = "Mode: Nearest"; stealModeLbl.Text = "Steal: Nearest" elseif stealMode == "Highest" then stealModeToggle.Text = "Mode: Highest"; stealModeLbl.Text = "Steal: Highest" else stealModeToggle.Text = "Mode: Selected"; stealModeLbl.Text = "Steal: Selected" end end
-        if _G.SavedConfig.StealRadius then stealRadiusValue = _G.SavedConfig.StealRadius; updateStealRadiusFromAlpha((stealRadiusValue - STEAL_RADIUS_MIN) / (STEAL_RADIUS_MAX - STEAL_RADIUS_MIN)) end
+        if _G.SavedConfig.StealRadius then radiusSlider.setRaw(_G.SavedConfig.StealRadius) end
         if _G.SavedConfig.AutoTPEnabled then autoTPEnabled = _G.SavedConfig.AutoTPEnabled; autoTPToggle.Text = autoTPEnabled and "Auto TP ON" or "Auto TP OFF"; autoTPToggle.BackgroundColor3 = autoTPEnabled and Color3.fromRGB(200,50,50) or Color3.fromRGB(170,0,0) end
         if _G.SavedConfig.AntiRagdoll then
             antiRagdollEnabled = _G.SavedConfig.AntiRagdoll
@@ -3053,3 +3204,5 @@ task.spawn(function()
     until os.clock() - _t0 > 15
     if not currentPets or #currentPets == 0 then refreshList() end
 end)
+
+print("[+] menu loaded")
